@@ -44,7 +44,8 @@ class CSA(master:String, fileName:String) extends Serializable {
         System.setProperty("spark.executor.memory", "2g")
 
         // Create New SparkContext
-        val sc = new SparkContext(master, "CSA", System.getenv("SPARK_HOME"))
+        val sc = new SparkContext(master, "CSA", System.getenv("SPARK_HOME"), 
+                                  List("target/scala-2.9.3/csa_2.9.3-1.0.jar"))
         
         // Set sampling rate for SA
         val sampleRate = (1 << 5)
@@ -81,8 +82,8 @@ class CSA(master:String, fileName:String) extends Serializable {
         // These are currently local to the master -- Distribute
         println("Created sampled SA")
 
-        //BPos = new Dictionary(BPosInit)
-        //BPosInit = null
+        BPos = new Dictionary(BPosInit)
+        BPosInit = null
         
         println("Created BPos bitmap")
 
@@ -196,6 +197,10 @@ class CSA(master:String, fileName:String) extends Serializable {
 //        
 //        println("Created Wavelet Tree RDD")
 
+        // TODO: Remove all code after this!
+        val mSA = saMap.map(t => (t._2._1, t._2._2)).collectAsMap
+        val mSAinv = saMap.map(t => (t._2._2, t._2._1)).collectAsMap
+
     }
     
     def createHashMap(data:Iterator[(Int, WaveletTree)]) = {
@@ -217,6 +222,110 @@ class CSA(master:String, fileName:String) extends Serializable {
         contextMap
     }
     
+    def getCinvIndex(i:Long):Int = {
+        var sp = 0
+        var ep = columnOffset.size - 1
+        while(sp <= ep) {
+            val m = (sp + ep) / 2
+            if(columnOffset(m) == i) return m
+            else if(i < columnOffset(m)) ep = m - 1
+            else sp = m + 1
+        }
+        ep
+    }
+
+    def binSearchPsi(value:Long, start:Long, end:Long, flag:Boolean):Long = {
+        
+        var sp = start
+        var ep = end
+
+        while(sp <= ep) {
+            val m = (sp + ep) / 2
+            val psiVal = lookupPsi(m)
+            if(psiVal == value) return m
+            else if(value < psiVal) ep = m - 1
+            else sp = m + 1
+        }
+        
+        if(flag) ep else sp
+    }
+    
+    def getRangeBckSlow(p:String):(Long, Long) = {
+        var range = (0L, -1L)
+        var m = p.length
+        var sp = 0L
+        var ep = 0L
+        var c1 = 0L
+        var c2 = 0L
+        
+        if(alphabetId.contains(p(m - 1))) {
+            sp = columnOffset(alphabetId(p(m - 1)))
+            ep = columnOffset(alphabetId(p(m - 1)) + 1) - 1
+        } else return range
+        
+        for(i <- m - 2 to 0 by -1) {
+            if(alphabetId.contains(p(i))) {
+                c1 = columnOffset(alphabetId(p(i)))
+                c2 = columnOffset(alphabetId(p(i)) + 1) - 1
+            } else return range
+            sp = binSearchPsi(sp, c1, c2, false)
+            ep = binSearchPsi(ep, c1, c2, true)
+            if(sp > ep) return range
+        }
+        (sp, ep)
+    }
+    
+    def getRangeBck(p:String):(Long, Long) = {
+        var m = p.length
+        if(m <= 2) getRangeBckSlow(p)
+
+        var range = (0L, -1L)
+        var a = alphabetId(p(m - 3))
+        var c = contextId(p(m - 2) * 256 + p(m - 1))
+        var startOff = binSearch(necOffset(a), c) - 1
+        var sp = columnOffset(a) + cellOffset(a)(startOff)
+        var ep = columnOffset(a) + cellOffset(a)(startOff + 1) - 1
+        var c1 = 0L
+        var c2 = 0L
+
+        for(i <- m - 4 to 0 by -1) {
+            if(alphabetId.contains(p(i))) {
+                a = alphabetId(p(i))
+                c = contextId(p(i + 1) * 256 + p(i + 2))
+                startOff = binSearch(necOffset(a), c) - 1
+                c1 = columnOffset(a) + cellOffset(a)(startOff)
+                c2 = columnOffset(a) + cellOffset(a)(startOff + 1) - 1
+            } else return range
+            sp = binSearchPsi(sp, c1, c2, false)
+            ep = binSearchPsi(ep, c1, c2, true)
+            if(sp > ep) return range
+        }
+        (sp, ep)
+    }
+    
+    def count(p:String) = {
+        val range = getRangeBck(p)
+        range._2 - range._1 + 1
+    }
+    
+    def locate(p:String) = {
+        val range = getRangeBck(p)
+        val size = range._2 - range._1 + 1
+        if(size <= 0) null
+        else Array.tabulate(size.toInt)(i => lookupSA(range._1 + i))
+    }
+    
+    def extract(i:Long, j:Long) = {
+        var s = lookupSAinv(i)
+        val size = (j - i + 1).toInt
+        var text = new Array[Char](size)
+        for(k <- 0 to size - 1) {
+            text(k) = alphabets(getCinvIndex(s)).toChar
+            s = lookupPsi(s)
+        }
+        text
+    }
+
     def binSearch(V:Seq[Long], i:Long):Long = {
         var sp = 0
         var ep = V.size - 1
@@ -240,7 +349,6 @@ class CSA(master:String, fileName:String) extends Serializable {
         }
         ep + 1
     }
-    
 
     def lookupPsi(i:Long) = {
         //println("Lookup Psi, i = " + i)
