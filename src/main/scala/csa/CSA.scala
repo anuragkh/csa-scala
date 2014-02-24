@@ -4,203 +4,522 @@ import org.apache.spark.util._
 import org.apache.spark.SparkContext
 import org.apache.spark.SparkContext._
 import org.apache.spark.rdd.RDD
+import org.apache.spark.RangePartitioner
+import org.apache.spark.HashPartitioner
+import org.apache.hadoop.io.Text
+import org.apache.hadoop.io.LongWritable
+import org.apache.hadoop.mapred.TextInputFormat
+import org.apache.hadoop.fs.FileSystem
+import org.apache.hadoop.conf.Configuration
+import org.apache.spark.broadcast.Broadcast
+import org.apache.hadoop.fs.Path
+import org.apache.spark.storage.StorageLevel
 
-import collection.mutable.ArrayBuffer
-import collection.immutable.HashMap
+import java.io.File
+import java.io.PrintWriter
+import scala.collection.mutable.ArrayBuffer
+import scala.collection.immutable.HashMap
 import wavelettree.WaveletTree
 import dictionary.Dictionary
 import bitmap.BMArray
 import bitmap.BitMap
+import scala.collection.mutable.ListBuffer
+import scala.collection.Map
+import scala.collection.immutable.Vector
+import scala.util.Random
 
-class CSA(master:String, fileName:String) extends Serializable {
+class CSA(master:String, fileName:String, numTasks:String, memory:String) extends Serializable {
 
     var BPos:Dictionary = _
     var SA:BMArray = _
     var SAinv:BMArray = _
     var count:Long = _
-    val sampleRate = 1 << 5
-    var waveletMap:collection.Map[Int,wavelettree.WaveletTree] = _
+    var bCount:Broadcast[Long] = null
+    val sampleRate = 1 << 5               
+    var waveletMap:Map[Int,WaveletTree] = _
     var columnOffset:Array[Long] = _
     var rowOffset:Array[Long] = _
     var cellOffset:Array[Seq[Long]] = _
     var nerOffset:Array[Seq[Int]] = _
     var necOffset:Array[Seq[Int]] = _
-    var contextSizes:Array[Int] = _
     var partitionOffset:Array[Int] = _
     var contextId:HashMap[Int, Int] = new HashMap[Int, Int]
     var contexts:Array[Int] = _
     var alphabetId:HashMap[Int, Int] = new HashMap[Int, Int]
     var alphabets:Array[Int] = _
-
-    var sigmaMap:HashMap[Int, Int] = _
     var numContexts:Int = _
     var numAlphabet:Int = _
+    var partSizes:Array[Long] = _
 
     build
 
     def build() = {
 
         // Set Spark System properties
-        System.setProperty("spark.executor.memory", "2g")
+        System.setProperty("spark.executor.memory", memory)
+        System.setProperty("spark.default.parallelism", numTasks)
+        System.setProperty("spark.akka.frameSize", "1024");
+        // System.setProperty("spark.cores.max", "4")
+        System.setProperty("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+        System.setProperty("spark.kryo.registrator", "Registrator")
+        System.setProperty("spark.kryoserializer.buffer.mb", "24")
+        System.setProperty("spark.storage.memoryFraction", "0.3")
+        System.setProperty("spark.speculation", "true")
+        System.setProperty("spark.speculation.interval", "60000")
+        System.setProperty("spark.shuffle.consolidateFiles", "true")
 
         // Create New SparkContext
         val sc = new SparkContext(master, "CSA", System.getenv("SPARK_HOME"), 
                                   List("target/scala-2.9.3/csa_2.9.3-1.0.jar"))
-        
+        //val reporter = new org.apache.spark.scheduler.StatsReportListener()
+        //sc.addSparkListener(reporter)
+
         // Set sampling rate for SA
         val sampleRate = (1 << 5)
         
-        // Read SA values from file -- TODO: construct SA array
-        val saValues = sc.textFile(fileName)
-
+        // Start timer!
+        val startTimeBuild = System.currentTimeMillis
+        
         // Get count
-        count = saValues.count
-        
-        // Get initial SA Map
-        val saMap = saValues.map(line => line.split(" "))
-                            .map(line => (line(1).toLong, 
-                                         (line(0).toLong, 
-                                          line(1).toLong, 
-                                          line(2).toInt, 
-                                          line(3).toInt * 256 + line(4).toInt)))
+        val configuration:Configuration = new Configuration
+        var fileSystem:FileSystem = null
 
-        // Sample SA values
-        val saSampled = saMap.map(t => (t._2._1, t._2._2))
-                             .filter(_._2 % sampleRate == 0)
-                             .map(t => (t._1, (t._2 / sampleRate))).collect
-                             .sortWith((a, b) => (a._1 < b._1))
-
-        println("Collected SA sampling information")
-
-        SA = new BMArray(saSampled.size, Helper.intLog2(saSampled.size + 1))
-        var BPosInit = new BitMap(count)
-        for(i <- 0 to saSampled.size - 1) {
-          SA.setVal(i, saSampled(i)._2)
-          BPosInit.setBit(saSampled(i)._1.toInt)
+        if (fileName.startsWith("hdfs://")) {
+            configuration.addResource(
+                new Path("/root/ephemeral-hdfs/conf/core-site.xml"))
+            configuration.addResource(
+                new Path("/root/ephemeral-hdfs/conf/hdfs-site.xml"))
+            fileSystem = FileSystem.get(configuration)
+        } else {
+            fileSystem = FileSystem.getLocal(configuration).getRawFileSystem
         }
+
+        count = fileSystem.getFileStatus(new Path(fileName)).getLen + 1
+        bCount = sc.broadcast(count)
+
+        fileSystem.close
+
+        println("Count = " + count)
+
+        println("Num tasks = " + numTasks.toInt);
+        val textRDD = sc.hadoopFile(fileName,
+                                    classOf[TextInputFormat],
+                                    classOf[LongWritable],
+                                    classOf[Text],
+                                    numTasks.toInt)
+                        .map(t => (t._1.get, t._2.toString))
+                        .flatMap(splitLineWithIndex)
+                        .sortByKey(true)
+                        .persist(StorageLevel.MEMORY_ONLY_SER)
+                         
+        // count = textRDD.count + 1
+        // bCount = sc.broadcast(count)
+
+        textRDD.saveAsTextFile(fileName + "_textRDD");
+                         
+        // partSizes = textRDDInit.mapPartitionsWithIndex{
+        //                             case(idx, data) => Iterator((idx, data.size))
+        //                             }
+        //                         .collect
+        //                         .sortBy(_._1)
+        //                         .map(_._2.toLong)
         
-        // These are currently local to the master -- Distribute
-        println("Created sampled SA")
+        // println("Initial partSizes")
+        // partSizes.foreach(println)                           
+        // for(i <- 1 to partSizes.size - 1)
+        //     partSizes(i) += partSizes(i - 1)
 
-        BPos = new Dictionary(BPosInit)
-        BPosInit = null
-        
-        println("Created BPos bitmap")
+        // println("Final partSizes")
+        // partSizes.foreach(println)
+            
+        // val textRDD = textRDDInit.mapPartitionsWithIndex(mapToNewIndex)
+        //                          .persist(StorageLevel.MEMORY_ONLY_SER)
 
-        SAinv = new BMArray(saSampled.size, Helper.intLog2(saSampled.size + 1))
-        for(i <- 0 to saSampled.size - 1) {
-          SAinv.setVal(SA.getVal(i).toInt, i)
-        }
-        
-        println("Created sampled SAinv")
+        // println("Count = " + textRDD.count)
 
-        val psiMap = saMap.flatMap(t => 
-                                    Iterator(t,
-                                             (((t._1 - 1 + count) % count).toLong,
-                                             (t._2._1, (-1).toLong, -1, -1))
-                                             )
-                                   )
-        val psiRDD = psiMap.reduceByKey((a, b) => 
-                                            if(a._2 == -1) 
-                                                (b._1, a._1, b._3, b._4) 
-                                            else (a._1, b._1, a._3, a._4))
-                           .map(t => (t._2._1, (t._2._2, t._2._3, t._2._4)))
 
-        // At this point, (K, V) = (i, (psi(i), sigma, context))
+        val suffRDD = makeSuffixArray(textRDD).persist(StorageLevel.MEMORY_ONLY_SER)
+        println("Size of SA = " + suffRDD.count)
 
-        columnOffset = psiRDD.map(t => (t._2._2, t._1))
-                             .reduceByKey((a, b) => if(a < b) a else b)
-                             .map(t => t._2)
-                             .collect.sorted
+        val tripletRDD = textRDD.flatMap(t => Iterator((t._1, (t._2.toInt, 0)), 
+                                                       ((t._1 - 1 + bCount.value) % bCount.value, (t._2.toInt, 1)), 
+                                                       ((t._1 - 2 + bCount.value) % bCount.value, (t._2.toInt, 2))))
+                                .groupByKey
+                                .mapValues(t => {
+                                        val _t = t.sortBy(_._2).map(_._1)
+                                        (_t(0), _t(1) * 256 + _t(2))
+                                    })
 
-        numAlphabet = columnOffset.size
-        println("Created Column Offsets, size = " + numAlphabet)
-        
-        rowOffset = psiRDD.map(t => (t._2._3, 1))
-                          .reduceByKey((a:Int, b:Int) => a + b)
-                          .collect
-                          .sortWith((a, b) => a._1 < b._1)
-                          .map(t => t._2.toLong)
+        // tripletRDD.saveAsTextFile(fileName + "_triplet")
+        val saMap = suffRDD.map(_.swap)
+                           .join(tripletRDD)
+                           .map(t => (t._1, (t._2._1, t._1, t._2._2._1, t._2._2._2)))
+                           .persist(StorageLevel.MEMORY_ONLY_SER)
 
-        for(i <- 1 to rowOffset.size - 1)
-            rowOffset(i) += rowOffset(i - 1)
-        for(i <- rowOffset.size - 1 to 1 by -1)
-            rowOffset(i) = rowOffset(i - 1)
+        println("SA Map count = " + saMap.count)
 
-        rowOffset(0) = 0
-        numContexts = rowOffset.size
-        println("Created Row Offsets, size = " + numContexts)
-        
-        cellOffset = psiRDD.map(t => ((t._2._2, t._2._3), t._1))
-                                .groupByKey.map(t => (t._1._1, t._2.min))
-                                .groupByKey.map(t => t._2.sorted)
-                                .collect.sortWith((x, y) => x(0) < y(0))
-        
-        cellOffset = cellOffset.map(list =>  {
-                                    val min = list.min
-                                    list.map(element => element - min)
-                                })
+        // saMap.saveAsTextFile(fileName + "_samap")
 
-        println("Created Cell Offsets")
+//        val suffRDD = textRDD.flatMap(t => mapToPrev(t, 1024))
+//                             .groupByKey
+//                             .map(t => 
+//                                (t._2.sortBy(_._1).map(e => e._2)
+//                                                        .mkString, t._1))
+//                             .sortByKey(true)
+//                             .persist(StorageLevel.MEMORY_ONLY_SER)
+//        
+//        println("Printing SuffixRDD")
+//        suffRDD.saveAsTextFile(fileName + "_files")
+//
+//        partSizes = suffRDD.mapPartitionsWithIndex{
+//                                    case(idx, data) => Iterator((idx, data.size))
+//                                    }
+//                           .collect
+//                           .sortBy(_._1)
+//                           .map(t => t._2)
+//
+//        for(i <- 1 to partSizes.size - 1)
+//            partSizes(i) = partSizes(i - 1)
+//            
+//        val saValues = suffRDD.mapPartitionsWithIndex(mapToNewIndex)
+//                              .persist(StorageLevel.MEMORY_ONLY_SER)
+//        saValues.saveAsTextFile(fileName + "_savalues")
+//
+//        // val saValues = sc.textFile(fileName)
+//
+//        // Get initial SA Map
+//        // val saMap = saValues.map(line => line.split(" "))
+//        //                     .map(line => (line(1).toLong, 
+//        //                                  (line(0).toLong, 
+//        //                                   line(1).toLong, 
+//        //                                   line(2).toInt, 
+//        //                                   line(3).toInt * 256 + line(4).toInt)))
+//
+//        val saMap = saValues.map(t => (t._2, t))
+//                            .persist(StorageLevel.MEMORY_ONLY_SER)
+//
+       // Sample SA values
+       var saSampled = saMap.map(t => (t._2._1, t._2._2))
+                            .filter(_._2 % sampleRate == 0)
+                            .map(t => (t._1, (t._2 / sampleRate)))
+                            .persist(StorageLevel.MEMORY_ONLY_SER)
+                            //.collect
+                            //.sortWith((a, b) => (a._1 < b._1))
 
-        contexts = psiRDD.map(t => (t._2._3, 0))
+       println("Collected SA sampling information")
+       
+       // // These are currently local to the master -- Distribute
+       // val sampledSize = saSampled.size
+       // SA = new BMArray(sampledSize, Helper.intLog2(sampledSize + 1))
+       // var BPosInit = new BitMap(count)
+       // for(i <- 0 to saSampled.size - 1) {
+       //     SA.setVal(i, saSampled(i)._2)
+       //     BPosInit.setBit(saSampled(i)._1.toInt)
+       // }
+       // println("Created sampled SA")
+       
+       // // Cleanup!
+       // saSampled = null
+       // System.gc
+
+       // BPos = new Dictionary(BPosInit)
+       // println("Created BPos bitmap")
+
+       // // Cleanup again!
+       // BPosInit = null
+       // System.gc
+
+       val psiRDD = saMap.flatMap(t => 
+                                   Iterator(t,
+                                            (((t._1 - 1L + bCount.value) % bCount.value),
+                                            (t._2._1, (-1).toLong, -1, -1))
+                                            )
+                                  )
+                         .reduceByKey((a, b) => 
+                                           if(a._2 == -1) 
+                                               (b._1, a._1, b._3, b._4) 
+                                           else (a._1, b._1, a._3, a._4))
+                         .map(t => (t._2._1, (t._2._2, t._2._3, t._2._4)))
+                         .persist(StorageLevel.MEMORY_ONLY_SER)
+
+        saMap.unpersist(true);
+
+       // At this point, (K, V) = (i, (psi(i), sigma, context))
+       columnOffset = psiRDD.map(t => (t._2._2, t._1))
+                            .reduceByKey((a, b) => if(a < b) a else b)
+                            .map(t => t._2)
+                            .collect.sorted
+
+       numAlphabet = columnOffset.size
+       println("Created Column Offsets, size = " + numAlphabet)
+       
+       rowOffset = psiRDD.map(t => (t._2._3, 1))
+                         .reduceByKey((a:Int, b:Int) => a + b)
+                         .collect
+                         .sortWith((a, b) => a._1 < b._1)
+                         .map(t => t._2.toLong)
+
+       for(i <- 1 to rowOffset.size - 1)
+           rowOffset(i) += rowOffset(i - 1)
+       for(i <- rowOffset.size - 1 to 1 by -1)
+           rowOffset(i) = rowOffset(i - 1)
+       rowOffset(0) = 0
+       
+       numContexts = rowOffset.size
+       println("Created Row Offsets, size = " + numContexts)
+       
+       cellOffset = psiRDD.map(t => ((t._2._2, t._2._3), t._1))
+                               .groupByKey.map(t => (t._1._1, t._2.min))
+                               .groupByKey.map(t => t._2.sorted)
+                               .collect.sortWith((x, y) => x(0) < y(0))
+       
+       cellOffset = cellOffset.map(list =>  {
+                                   val min = list.min
+                                   list.map(element => element - min)
+                               })
+
+       println("Created Cell Offsets")
+
+       // I am here
+       
+       contexts = psiRDD.map(t => (t._2._3, 0))
+                        .groupByKey.map(_._1)
+                        .collect.sorted
+
+       for(i <- 0 to contexts.size - 1)
+           contextId += contexts(i) -> i
+           
+       println("Created Contexts Array and Map")
+       
+       alphabets = psiRDD.map(t => (t._2._2, 0))
                          .groupByKey.map(_._1)
                          .collect.sorted
 
-        for(i <- 0 to contexts.size - 1)
-            contextId += contexts(i) -> i
-            
-        println("Created Contexts Array and Map")
-        
-        alphabets = psiRDD.map(t => (t._2._2, 0))
-                          .groupByKey.map(_._1)
-                          .collect.sorted
+       println("Displaying alphabetId mapping")
+       for(i <- 0 to alphabets.size - 1)
+           alphabetId += alphabets(i) -> i
+       
+       val bAlphabetId = sc.broadcast(alphabetId)
+       val bContextId = sc.broadcast(contextId)
 
-        for(i <- 0 to alphabets.size - 1)
-            alphabetId += alphabets(i) -> i
+       println("Created Alphabets Array and Map")
 
-        println("Created Alphabets Array and Map")
+       necOffset = psiRDD.map(t => 
+                               ((bAlphabetId.value(t._2._2), 
+                                 bContextId.value(t._2._3)), 
+                                 0))
+                         .reduceByKey(_ + _)
+                         .map(t => t._1)
+                         .groupByKey.collect.sortWith((a, b) => a._1 < b._1)
+                         .map(t => t._2.sorted)
 
-        necOffset = psiRDD.map(t => 
-                                ((alphabetId(t._2._2), contextId(t._2._3)), 0))
-                          .reduceByKey(_ + _)
-                          .map(t => t._1)
-                          .groupByKey.collect.sortWith((a, b) => a._1 < b._1)
-                          .map(t => t._2.sorted)
-        println("Created Non-Empty Cells Column-Wise")
-        
-        nerOffset = psiRDD.map(t => 
-                                ((contextId(t._2._3), alphabetId(t._2._2)), 0))
-                          .reduceByKey(_ + _)
-                          .map(t => t._1)
-                          .groupByKey.collect.sortWith((a, b) => a._1 < b._1)
-                          .map(t => t._2.sorted)
-        println("Created Non-Empty Cells Row-Wise")
-        
-        contextSizes = nerOffset.map(t => t.size)
-        for(i <- 1 to contextSizes.size - 1) {
-            contextSizes(i) += contextSizes(i - 1)
-        }
+       println("Created Non-Empty Cells Column-Wise")
+       
+       nerOffset = psiRDD.map(t => 
+                               ((bContextId.value(t._2._3), 
+                                 bAlphabetId.value(t._2._2)), 
+                                 0))
+                         .reduceByKey(_ + _)
+                         .map(t => t._1)
+                         .groupByKey.collect.sortWith((a, b) => a._1 < b._1)
+                         .map(t => t._2.sorted)
+       println("Created Non-Empty Cells Row-Wise")
 
-        val psiContexts = psiRDD.map(t => (t._2._3, (t._2._1, t._2._2)))
-                                .groupByKey
-                                .map(t => (t._1, createContextMap(t._2.sortWith((x, y) => (x._2 < y._2)).asInstanceOf[ArrayBuffer[(Long, Int)]])))
+       // psiRDD(K, V) = (i, (psi(i), sigma, context))
+       val waveletRDD = psiRDD.map(t => (t._2._3, (t._2._1, t._2._2)))
+                              .groupByKey
+                              .map(t => 
+                                   (t._1, 
+                                   createContextMap(t._2.sortWith((x, y) => (x._2 < y._2))
+                                                        .asInstanceOf[ArrayBuffer[(Long, Int)]])))
+                              .map(t => (t._1, new WaveletTree(t._2)))
+                              .persist(StorageLevel.MEMORY_ONLY_SER)
+                               
+//        waveletMap = waveletRDD.collectAsMap
+       
+       println("Number of wavelet trees: " + waveletRDD.count)
+       println("Created Wavelet RDD")
+       // SAinv = new BMArray(sampledSize, Helper.intLog2(sampledSize + 1))
+       // for(i <- 0 to sampledSize - 1)
+       //   SAinv.setVal(SA.getVal(i).toInt, i)
+       // println("Created sampled SAinv")
 
-        // At this point, (K, V) = (context, Array(i, psi(i), sigma).sortedBy(sigma))
-        waveletMap = psiContexts.map(t => (t._1, new WaveletTree(t._2)))
-                                    .collectAsMap
-                                    
-        println("Collected wavelet map; construction complete!")
-//        waveletMap = waveletRDD.mapPartitions(data => Iterator(createHashMap(data))).cache
+       println("Construction Complete!")
+
+//        waveletMap = waveletRDD.mapPartitions(data => Iterator(createHashMap(data))).persist(StorageLevel.MEMORY_ONLY_SER)
 //        val boundaryKeys = waveletRDD.mapPartitionsWithIndex{case(idx, data) => Iterator(data.minBy(_._1)._1)}
 //        partitionOffset = boundaryKeys.collect.sorted
 //        
 //        println("Created Wavelet Tree RDD")
 
-        // TODO: Remove all code after this!
-        val mSA = saMap.map(t => (t._2._1, t._2._2)).collectAsMap
-        val mSAinv = saMap.map(t => (t._2._2, t._2._1)).collectAsMap
+        // Stop timer!
+        val endTimeBuild = System.currentTimeMillis
+        val buildTime = endTimeBuild - startTimeBuild
+        
+        println("Build time = " + buildTime + "ms")
+    }
+    
+    // def makeSuffixArrayNew(textRDD:RDD[(Long, Char)]) = {
 
+    //     val len = 1
+
+    //     var substrRDD = textRDD.mapValues(_.toInt.toLong)
+    //                            .sortByKey(true)
+    //                            .persist(StorageLevel.MEMORY_ONLY_SER)
+
+    //     var substrCount = textRDD.values.distinct.count
+    //     println("Initial distinct substring count = " + substrCount)
+
+    //     val indexCount = textRDD.count
+    //     println("Index count = " + indexCount)
+
+
+    // }
+    
+    def makeSuffixArray(textRDD:RDD[(Long, Char)]) = {
+        var len = 1
+        var substrRDD = textRDD.mapValues(_.toInt.toLong)
+                               .sortByKey(true)
+                               .persist(StorageLevel.MEMORY_ONLY_SER)
+        
+        var substrCount = textRDD.values.distinct.count
+        println("Initial Distinct Substring count = " + substrCount)
+
+        val indexCount = textRDD.count
+
+        while(substrCount < indexCount) {
+            println("Length: " + len)
+            //substrRDD = substrRDD.sortByKey(true)
+            //println("RDD TYPE: " + substrRDD.getClass.getSimpleName)
+            //println("Partitioner: " + substrRDD.partitioner)
+            
+            val mergeAndSwapRDD = substrRDD.flatMap(t => mapToLenIndex(t, len))
+                                        .reduceByKey(reduceToSingleTuple)
+                                        .map(t => ((t._2._1, t._2._2, ((new Random()).nextInt % 256).toChar), t._1))
+                                        .sortByKey(true)
+                                        .persist(StorageLevel.MEMORY_ONLY_SER)
+            
+            substrRDD.unpersist(true)
+            
+            var distinctCounts = mergeAndSwapRDD.mapPartitionsWithIndex(getDistinctCounts, true)
+                                        .collect
+                                        .sortBy(_._1)
+            println("distinctCounts size = " + distinctCounts.size)
+            
+            var beginOffsets = new Array[Long](distinctCounts.size)
+            beginOffsets(0) = 0
+            for(i <- 1 to distinctCounts.size - 1) {
+                val check = (distinctCounts(i - 1)._4 == distinctCounts(i)._3)
+                val off = if(check) (distinctCounts(i - 1)._2 - 1) 
+                          else distinctCounts(i - 1)._2
+                beginOffsets(i) = beginOffsets(i - 1) + off
+            }
+
+            substrCount = beginOffsets(beginOffsets.size - 1) + 
+                          distinctCounts(beginOffsets.size - 1)._2
+
+            distinctCounts = null
+            
+            substrRDD = mergeAndSwapRDD.mapPartitionsWithIndex((i, d) => 
+                                            remapIndices(i, d, beginOffsets), true)
+                                        .map(_.swap)
+                                        .persist(StorageLevel.MEMORY_ONLY_SER)
+            mergeAndSwapRDD.unpersist(true)
+            
+            println("Distinct substring count = " + substrCount)
+            println("Index count = " + indexCount)
+            len = if(substrCount != indexCount) len * 2 else len
+        }
+
+        substrRDD.map(_.swap).sortByKey(true)
+    
+    }
+
+    def mapToLenIndex(t:(Long, Long), len:Int):Iterator[(Long, (Long, Long))] = {
+        Iterator((t._1, (t._2, 0L)), 
+                 ((t._1 - len + bCount.value) % bCount.value, (t._2, 1L)))
+    }
+
+    def reduceToSingleTuple(a:(Long, Long), b:(Long, Long)) = {
+        if(a._2 == 0L) (a._1, b._1)
+        else (b._1, a._1)
+    }
+
+    def getDistinctCounts(i:Int, d:Iterator[((Long, Long, Char), Long)]) = {
+        var count = 0L
+        var prvSubstr:Tuple3[Long, Long, Char] = (-1L, -1L, 0.toChar)
+        var i = 0
+        var firstSubstr:Tuple3[Long, Long, Char] = (-1L, -1L, 0.toChar)
+
+        while(d.hasNext) {
+            val substr = d.next._1
+            if(i == 0) firstSubstr = substr
+            if(prvSubstr._1 != substr._1 || prvSubstr._2 != substr._2)
+                count += 1
+            prvSubstr = substr
+            i += 1
+        }
+        Iterator((i, count, firstSubstr, prvSubstr))
+    }
+
+    def remapIndices(i:Int, d:Iterator[((Long, Long, Char), Long)], beginOffsets:Seq[Long]) = {
+        val dataArray = new ListBuffer[(Long, Long)]()
+        var count = -1L
+        var prvSubstr:Tuple3[Long, Long, Char] = (-1L, -1L, 0.toChar)
+        val offset = beginOffsets(i)
+        while(d.hasNext) {
+            val elem = d.next
+            val substr = elem._1
+            if(prvSubstr._1 != substr._1 || prvSubstr._2 != substr._2)
+                count += 1
+            prvSubstr = substr
+            dataArray += ((offset + count, elem._2))
+        }
+        dataArray.iterator
+    }
+
+    // def mapToNewIndex(idx:Int, data:Iterator[(Long, Char)]) = {
+    //     val dataArray = new ListBuffer[(Long, Char)]()
+
+    //     var i = if(idx == 0) 0 
+    //             else partSizes(idx - 1)
+    //     while(data.hasNext) {
+    //         val curData = data.next
+    //         val c = curData._2
+    //         dataArray += ((i, c))
+    //         i += 1
+    //     }
+    //     if(i == bCount.value - 1) {
+    //         println("Nulling")
+    //         dataArray += ((i, '\0'))
+    //     }
+    //     dataArray.iterator
+    // }
+
+    def splitLineWithIndex(line:(Long, String)) = {
+        val lineoffset = line._1
+        val linestring = line._2
+        val size = linestring.length + 1
+
+        var lineArray = new Array[(Long, Char)](size)
+        for(i <- 0 to linestring.length - 1)
+            lineArray(i) = (lineoffset + i, linestring(i))
+
+        if(linestring.length + lineoffset == bCount.value - 1) {
+            println("Nulling!")
+            lineArray(linestring.length) = (lineoffset + linestring.length, 1.toChar)
+        } else {
+            // println("Not Nulling: " + bCount.value + ", " + (linestring.length + lineoffset))
+            lineArray(linestring.length) = (lineoffset + linestring.length, '\n')
+        }
+        lineArray.iterator
+    }
+
+    def mapToPrev(data:(Long, Char), L:Int) = {
+        var mappedData = new Array[(Long, (Int, Char))](L)
+        for(i <- 0 to L - 1)
+            mappedData(i) = ((data._1 - i + count) % count, (i, data._2))
+        mappedData.iterator
     }
     
     def createHashMap(data:Iterator[(Int, WaveletTree)]) = {

@@ -1,6 +1,6 @@
 package dictionary
 
-import scala.collection.mutable.ListBuffer
+import scala.collection.mutable.ArrayBuffer
 import scala.util.control.Breaks._
 import csa.Helper
 import bitmap.BitMap
@@ -24,7 +24,7 @@ class Dictionary(BM:BitMap) extends Serializable {
         var sumPosL1 = 0L
         var flag = 0
         var compSize = 0L
-        var dict:ListBuffer[Int] = new ListBuffer[Int]()
+        var dict:ArrayBuffer[Int] = new ArrayBuffer[Int]()
         var count = 0L
         var rankL1 = 0L
         var rankL2 = 0L
